@@ -1,0 +1,164 @@
+# coding=utf-8
+# Copyright 2018 The Hypebot Authors. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""League of Legends-specific extensions to BaseBot."""
+
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+from __future__ import unicode_literals
+
+from absl import app
+from absl import flags
+from absl import logging
+import grpc
+
+from hypebot import basebot
+from hypebot.commands import command_lib
+from hypebot.core import params_lib
+from hypebot.data.league import messages
+from hypebot.plugins import vegas_game_lib
+from hypebot.plugins.league import esports_lib
+from hypebot.plugins.league import game_lib
+from hypebot.plugins.league import items_lib
+from hypebot.plugins.league import rito_lib
+from hypebot.plugins.league import summoner_lib
+from hypebot.plugins.league import trivia_lib
+
+FLAGS = flags.FLAGS
+
+
+class HypeBot(basebot.BaseBot):
+  """Class for increasing hype in a chat application."""
+
+  DEFAULT_PARAMS = params_lib.MergeParams(basebot.BaseBot.DEFAULT_PARAMS, {
+      'name': 'HypeBot',
+      'riot': {
+          'api_address': 'localhost:50051',
+          'api_key': '',
+      },
+      # Channel to announce betting results.
+      'lcs_channel': {'name': '#lcs', 'id': '421671076385521664'},
+      # Where to play trivia.
+      'trivia_channels': [
+          {'name': '#trivia', 'id': '421675055878242305'}
+      ],
+      'commands': {
+          'StoryCommand': {'stories': {'wtf_poem': messages.POEM}},
+          'MemeCommand': {'choices': messages.ALL_MEMES},
+          # Summoner commands.
+          'ChampCommand': {},
+          'ChampsCommand': {},
+          'ChimpsCommand': {},
+          'WhoCommand': {},
+          # eSports commands.
+          'BodyCommand': {},
+          'LCSLivestreamLinkCommand': {},
+          'LCSMatchNotificationCommand': {},
+          'LCSPickBanRatesCommand': {},
+          'LCSPlayerStatsCommand': {},
+          'LCSScheduleCommand': {},
+          'LCSStandingsCommand': {},
+          'LCSResultsCommand': {},
+          'LCSRosterCommand': {},
+          'LCSRoosterCommand': {},
+          # LoL commands.
+          'FreeloCommand': {},
+          'ItemCommand': {},
+          'LoreCommand': {},
+          'PatchNotesCommand': {},
+          'ReforgedRuneCommand': {},
+          'SetApiKeyCommand': {},
+          'SkillCommand': {},
+          'StatsCommand': {},
+          'StatsAtCommand': {},
+          # Trivia commands.
+          'TriviaAddCommand': {},
+          'TriviaAnswerCommand': {},
+      },
+      'subscriptions': {
+          'lcs_bets': [
+              {'id': '418098011445395462', 'name': '#dev'},
+              {'id': '421671076385521664', 'name': '#lcs'},
+          ],
+          'lcs_match': [
+              {'id': '418098011445395462', 'name': '#dev'},
+              {'id': '421671076385521664', 'name': '#lcs'},
+          ],
+          'lcs_match_playoffs': [
+              {'id': '418098011445395462', 'name': '#dev'},
+              {'id': '421671076385521664', 'name': '#lcs'},
+          ],
+      },
+  })
+
+  def __init__(self, params):
+    super(HypeBot, self).__init__(params)
+    for channel in self._params.trivia_channels:
+      self._core.trivia.MakeNewChannel(channel)
+
+    # Place LCS gambling first, so it beats Stock to taking the game.
+    self._lcs_game = vegas_game_lib.LCSGame(self._core.esports)
+    self._core.betting_games.insert(0, self._lcs_game)
+    # Give _esports a chance at loading before trying to resolve LCS bets
+    self._core.scheduler.FixedRate(5 * 60, 30 * 60, self._LCSGameCallback)
+
+  def _InitCore(self):
+    super(HypeBot, self)._InitCore()
+    self._core.rito = self._GetRitoLib()
+    self._core.game = game_lib.GameLib(self._core.rito)
+    self._core.summoner = summoner_lib.SummonerLib(self._core.rito,
+                                                   self._core.game)
+    self._core.summoner_tracker = summoner_lib.SummonerTracker(
+        self._core.rito, self._core.user_prefs)
+    self._core.esports = esports_lib.EsportsLib(
+        self._core.proxy, self._core.executor, self._core.game,
+        self._core.timezone, self._core.rito)
+    self._core.items = items_lib.ItemsLib(self._core.rito)
+    self._core.lcs_channel = self._params.lcs_channel
+    # Trivia can probably be self contained once multiple parsers exist.
+    self._core.trivia = trivia_lib.TriviaMaster(self._core.game,
+                                                self._core.Reply)
+
+  ##############################
+  ### Private helper methods ###
+  ##############################
+
+  def _GetRitoLib(self):
+    api_key = (self._params.riot.api_key or
+               self._core.store.GetValue('riot_api_key', 'api_key'))
+    if not api_key:
+      logging.fatal('Rito API key failed to load.')
+    channel = grpc.insecure_channel(self._params.riot.api_address)
+    return rito_lib.RitoLib(self._core.proxy, channel, api_key)
+
+  @command_lib.RequireReady('_core.esports')
+  def _LCSGameCallback(self):
+    self._core.esports.UpdateEsportsMatches()
+    notifications = self._core.bets.SettleBets(self._lcs_game,
+                                               self._core.name.lower(),
+                                               self._core.Reply)
+    if notifications:
+      self._core.PublishMessage('lcs_bets', notifications)
+
+
+def main(argv):
+  if len(argv) > 1:
+    raise app.UsageError('Too many command-line arguments.')
+  hypebot = HypeBot(FLAGS.params)
+  hypebot.interface.Loop()
+
+
+if __name__ == '__main__':
+  app.run(main)
